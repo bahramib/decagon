@@ -4,7 +4,9 @@ from operator import itemgetter
 from itertools import combinations
 import time
 import os
+import random
 
+import pandas as pd
 import tensorflow as tf
 import numpy as np
 import networkx as nx
@@ -33,6 +35,166 @@ np.random.seed(0)
 #
 ###########################################################
 
+def load_decagon_data(use_dummy=False, ppi_path='polypharmacy/bio-decagon-ppi.csv', 
+                     drug_target_path='polypharmacy/bio-decagon-targets-all.csv',
+                     combo_path='polypharmacy/bio-decagon-combo.csv'):
+    """
+    Load and preprocess data for Decagon model from the bio-decagon datasets.
+    
+    Args:
+        use_dummy: If True, use synthetic dummy data. If False, load real data.
+        ppi_path: Path to protein-protein interaction CSV file
+        drug_target_path: Path to drug-target interaction CSV file
+        combo_path: Path to drug-drug interaction CSV file
+    
+    Returns:
+        Processed data in the format expected by Decagon
+    """
+    
+    if use_dummy:
+        # Use the synthetic dummy data
+        val_test_size = 0.05
+        n_genes = 19080
+        n_drugs = 645
+        n_drugdrug_rel_types = 1317
+        gene_net = nx.planted_partition_graph(360, 53, 0.1, 0.01, seed=42)
+        gene_adj = nx.adjacency_matrix(gene_net)
+        gene_degrees = np.array(gene_adj.sum(axis=0)).squeeze()
+        gene_drug_adj = sp.csr_matrix((10 * np.random.randn(n_genes, n_drugs) > 15).astype(int))
+        drug_gene_adj = gene_drug_adj.transpose(copy=True)
+        drug_drug_adj_list = []
+        tmp = np.dot(drug_gene_adj, gene_drug_adj)
+        
+        for i in range(n_drugdrug_rel_types):
+            if i % 15 == 0:
+                print("Round %d with side effect %s" % (i, i))
+            mat = np.zeros((n_drugs, n_drugs))
+            for d1, d2 in combinations(list(range(n_drugs)), 2):
+                if random.randint(0, 1000) < 3:
+                    mat[d1, d2] = mat[d2, d1] = 1.
+            drug_drug_adj_list.append(sp.csr_matrix(mat))
+        drug_degrees_list = [np.array(drug_adj.sum(axis=0)).squeeze() for drug_adj in drug_drug_adj_list]
+        
+    else:
+        # Load real data from the CSV files
+        from polypharmacy.utility import load_ppi, load_targets, load_combo_se
+        
+        print("Loading PPI (Protein-Protein Interactions)...")
+        ppi_network, gene2idx = load_ppi(ppi_path)
+        n_genes = len(gene2idx)
+        gene_adj = nx.adjacency_matrix(ppi_network)
+        gene_degrees = np.array(gene_adj.sum(axis=0)).squeeze()
+        
+        print("Loading Drug-Target Interactions...")
+        drug2proteins = load_targets(drug_target_path)
+        
+        print("Loading Drug-Drug Interactions...")
+        drug2drug, drug2se, se2name = load_combo_se(combo_path)
+        
+        # Extract all unique drugs
+        all_drugs = set()
+        for combo, [drug1, drug2] in drug2drug.items():
+            all_drugs.add(drug1)
+            all_drugs.add(drug2)
+        
+        # Create mapping for drugs (STITCH IDs) to indices
+        drug2idx = {drug: i for i, drug in enumerate(all_drugs)}
+        n_drugs = len(drug2idx)
+        
+        print("Number of unique genes/proteins: %d" % n_genes)
+        print("Number of unique drugs: %d" % n_drugs)
+        
+        # Group side effects and create a mapping
+        unique_se = set()
+        for se_set in drug2se.values():
+            unique_se.update(se_set)
+        se2idx = {se: i for i, se in enumerate(unique_se)}
+        n_se_types = len(se2idx)
+        
+        print("Number of unique side effect types: %d" % n_se_types)
+        
+        # Create drug-gene adjacency matrix (n_drugs x n_genes)
+        gene_drug_adj = sp.lil_matrix((n_genes, n_drugs))
+        for drug, proteins in drug2proteins.items():
+            if drug in drug2idx:
+                drug_idx = drug2idx[drug]
+                for protein in proteins:
+                    if protein in gene2idx:
+                        gene_idx = gene2idx[protein]
+                        gene_drug_adj[gene_idx, drug_idx] = 1
+        
+        gene_drug_adj = gene_drug_adj.tocsr()
+        drug_gene_adj = gene_drug_adj.transpose(copy=True)
+        
+        # Create drug-drug adjacency matrices for each side effect type
+        drug_drug_adj_list = []
+        count = 0
+        for se in unique_se:
+            count += 1
+            if count % 15 == 0:
+                print("Round %d with side effect %s" % (count, se))
+            mat = sp.lil_matrix((n_drugs, n_drugs))
+            for combo, se_set in drug2se.items():
+                if se in se_set:
+                    drug1, drug2 = drug2drug[combo]
+                    if drug1 in drug2idx and drug2 in drug2idx:
+                        d1_idx = drug2idx[drug1]
+                        d2_idx = drug2idx[drug2]
+                        mat[d1_idx, d2_idx] = 1
+                        mat[d2_idx, d1_idx] = 1  # symmetric
+            drug_drug_adj_list.append(mat.tocsr())
+        
+        drug_degrees_list = [np.array(adj.sum(axis=0)).squeeze() for adj in drug_drug_adj_list]
+    
+    # Prepare data representation (same for both dummy and real data)
+    val_test_size = 0.05
+    
+    adj_mats_orig = {
+        (0, 0): [gene_adj, gene_adj.transpose(copy=True)],
+        (0, 1): [gene_drug_adj],
+        (1, 0): [drug_gene_adj],
+        (1, 1): drug_drug_adj_list + [x.transpose(copy=True) for x in drug_drug_adj_list],
+    }
+    degrees = {
+        0: [gene_degrees, gene_degrees],
+        1: drug_degrees_list + drug_degrees_list,
+    }
+    
+    # Generate features (identity matrices)
+    gene_feat = sp.identity(n_genes)
+    gene_nonzero_feat, gene_num_feat = gene_feat.shape
+    gene_feat = preprocessing.sparse_to_tuple(gene_feat.tocoo())
+    
+    drug_feat = sp.identity(n_drugs)
+    drug_nonzero_feat, drug_num_feat = drug_feat.shape
+    drug_feat = preprocessing.sparse_to_tuple(drug_feat.tocoo())
+    
+    num_feat = {
+        0: gene_num_feat,
+        1: drug_num_feat,
+    }
+    nonzero_feat = {
+        0: gene_nonzero_feat,
+        1: drug_nonzero_feat,
+    }
+    feat = {
+        0: gene_feat,
+        1: drug_feat,
+    }
+    
+    edge_type2dim = {k: [adj.shape for adj in adjs] for k, adjs in adj_mats_orig.items()}
+    edge_type2decoder = {
+        (0, 0): 'bilinear',
+        (0, 1): 'bilinear',
+        (1, 0): 'bilinear',
+        (1, 1): 'dedicom',
+    }
+    
+    edge_types = {k: len(v) for k, v in adj_mats_orig.items()}
+    num_edge_types = sum(edge_types.values())
+    print("Edge types:", "%d" % num_edge_types)
+    
+    return val_test_size, adj_mats_orig, degrees, num_feat, nonzero_feat, feat, edge_type2dim, edge_type2decoder, edge_types, num_edge_types
 
 def get_accuracy_scores(edges_pos, edges_neg, edge_type):
     feed_dict.update({placeholders['dropout']: 0})
@@ -78,7 +240,6 @@ def get_accuracy_scores(edges_pos, edges_neg, edge_type):
 
     return roc_sc, aupr_sc, apk_sc
 
-
 def construct_placeholders(edge_types):
     placeholders = {
         'batch': tf.placeholder(tf.int32, name='batch'),
@@ -113,76 +274,10 @@ def construct_placeholders(edge_types):
 # (3) Train & test the model.
 ####
 
-val_test_size = 0.05
-n_genes = 500
-n_drugs = 400
-n_drugdrug_rel_types = 3
-gene_net = nx.planted_partition_graph(50, 10, 0.2, 0.05, seed=42)
+from polypharmacy.utility import *
 
-gene_adj = nx.adjacency_matrix(gene_net)
-gene_degrees = np.array(gene_adj.sum(axis=0)).squeeze()
-
-gene_drug_adj = sp.csr_matrix((10 * np.random.randn(n_genes, n_drugs) > 15).astype(int))
-drug_gene_adj = gene_drug_adj.transpose(copy=True)
-
-drug_drug_adj_list = []
-tmp = np.dot(drug_gene_adj, gene_drug_adj)
-for i in range(n_drugdrug_rel_types):
-    mat = np.zeros((n_drugs, n_drugs))
-    for d1, d2 in combinations(list(range(n_drugs)), 2):
-        if tmp[d1, d2] == i + 4:
-            mat[d1, d2] = mat[d2, d1] = 1.
-    drug_drug_adj_list.append(sp.csr_matrix(mat))
-drug_degrees_list = [np.array(drug_adj.sum(axis=0)).squeeze() for drug_adj in drug_drug_adj_list]
-
-
-# data representation
-adj_mats_orig = {
-    (0, 0): [gene_adj, gene_adj.transpose(copy=True)],
-    (0, 1): [gene_drug_adj],
-    (1, 0): [drug_gene_adj],
-    (1, 1): drug_drug_adj_list + [x.transpose(copy=True) for x in drug_drug_adj_list],
-}
-degrees = {
-    0: [gene_degrees, gene_degrees],
-    1: drug_degrees_list + drug_degrees_list,
-}
-
-# featureless (genes)
-gene_feat = sp.identity(n_genes)
-gene_nonzero_feat, gene_num_feat = gene_feat.shape
-gene_feat = preprocessing.sparse_to_tuple(gene_feat.tocoo())
-
-# features (drugs)
-drug_feat = sp.identity(n_drugs)
-drug_nonzero_feat, drug_num_feat = drug_feat.shape
-drug_feat = preprocessing.sparse_to_tuple(drug_feat.tocoo())
-
-# data representation
-num_feat = {
-    0: gene_num_feat,
-    1: drug_num_feat,
-}
-nonzero_feat = {
-    0: gene_nonzero_feat,
-    1: drug_nonzero_feat,
-}
-feat = {
-    0: gene_feat,
-    1: drug_feat,
-}
-
-edge_type2dim = {k: [adj.shape for adj in adjs] for k, adjs in adj_mats_orig.items()}
-edge_type2decoder = {
-    (0, 0): 'bilinear',
-    (0, 1): 'bilinear',
-    (1, 0): 'bilinear',
-    (1, 1): 'dedicom',
-}
-
-edge_types = {k: len(v) for k, v in adj_mats_orig.items()}
-num_edge_types = sum(edge_types.values())
-print("Edge types:", "%d" % num_edge_types)
+# Load data (True for dummy, False for real data)
+val_test_size, adj_mats_orig, degrees, num_feat, nonzero_feat, feat, edge_type2dim, edge_type2decoder, edge_types, num_edge_types = load_decagon_data(use_dummy=True)
 
 ###########################################################
 #
